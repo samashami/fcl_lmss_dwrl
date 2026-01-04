@@ -1,0 +1,36 @@
+# =========================
+# DATA (PRIVATE / LOCAL)
+# =========================
+src/data/DWRL_clean/
+src/data/DWRL_extracted/
+src/data/DWRL_merged/
+**/DWRL*/
+**/dwrl*/
+
+# =========================
+# ARCHIVES & ARTIFACTS
+# =========================
+*.zip
+*.tar
+*.tar.gz
+
+# =========================
+# TRAINING OUTPUTS
+# =========================
+results/
+wandb/
+runs/
+
+# =========================
+# MODEL CHECKPOINTS
+# =========================
+*.pt
+*.pth
+*.ckpt
+
+# =========================
+# CACHE & OS JUNK
+# =========================
+__pycache__/
+.ipynb_checkpoints/
+.DS_Store
