@@ -72,13 +72,27 @@ class DWRLDataset(Dataset):
     """
     def __init__(self, csv_path: Path, transform=None):
         self.csv_path = Path(csv_path)
+        self.transform = transform
+
+        # load CSV
         self.df = pd.read_csv(self.csv_path)
 
         # basic validation
-        assert "path" in self.df.columns and "label" in self.df.columns, \
-            f"{csv_path} must contain columns: path,label"
+        required = {"path", "label"}
+        if not required.issubset(self.df.columns):
+            raise ValueError(f"{csv_path} must contain columns: path,label")
 
-        self.transform = transform
+        # drop rows with missing image files (robust against dataset changes)
+        exists = self.df["path"].apply(lambda p: Path(p).exists())
+        n_missing = (~exists).sum()
+
+        if n_missing > 0:
+            print(
+                f"[WARN] {n_missing} missing image files in {self.csv_path.name} "
+                f"-> dropping them",
+                flush=True,
+            )
+            self.df = self.df[exists].reset_index(drop=True)
 
     def __len__(self):
         return len(self.df)

@@ -31,6 +31,11 @@ def main():
         for p in list_images(class_dir):
             rows.append({"path": str(p.resolve()), "label": c})
 
+    # after rows filled
+    bad = [r for r in rows if not Path(r["path"]).exists()]
+    if bad:
+        raise FileNotFoundError(f"{len(bad)} rows point to missing files. Example: {bad[0]}")
+
     df = pd.DataFrame(rows)
     print("Total images:", len(df))
     print("Per-class counts:\n", df["label"].value_counts())

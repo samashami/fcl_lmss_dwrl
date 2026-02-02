@@ -10,6 +10,7 @@ import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms, models
 from PIL import Image
+from src.data.dwrl_transforms import make_dwrl_transforms
 
 # -----------------------------
 # Config
@@ -19,7 +20,7 @@ IMG_SIZE = 224
 BATCH_SIZE = 64
 EPOCHS = 10
 LR = 1e-4
-NUM_WORKERS = 0  # mac safe
+NUM_WORKERS = 0  
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SPLITS_DIR = REPO_ROOT / "src" / "data" / "splits"
@@ -37,25 +38,25 @@ DEVICE = "mps" if torch.backends.mps.is_available() else ("cuda" if torch.cuda.i
 # -----------------------------
 # Transforms
 # -----------------------------
-def make_transforms(img_size: int = 224):
-    train_tf = transforms.Compose([
-        transforms.Resize((img_size, img_size)),
-        transforms.RandomHorizontalFlip(p=0.5),
-        transforms.RandomRotation(20),
-        transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.05),
-        transforms.RandomResizedCrop(img_size, scale=(0.85, 1.0)),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                             std=[0.229, 0.224, 0.225]),
-    ])
+# def make_transforms(img_size: int = 224):
+#     train_tf = transforms.Compose([
+#         transforms.Resize((img_size, img_size)),
+#         transforms.RandomHorizontalFlip(p=0.5),
+#         transforms.RandomRotation(20),
+#         transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.05),
+#         transforms.RandomResizedCrop(img_size, scale=(0.85, 1.0)),
+#         transforms.ToTensor(),
+#         transforms.Normalize(mean=[0.485, 0.456, 0.406],
+#                              std=[0.229, 0.224, 0.225]),
+#     ])
 
-    eval_tf = transforms.Compose([
-        transforms.Resize((img_size, img_size)),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                             std=[0.229, 0.224, 0.225]),
-    ])
-    return train_tf, eval_tf
+#     eval_tf = transforms.Compose([
+#         transforms.Resize((img_size, img_size)),
+#         transforms.ToTensor(),
+#         transforms.Normalize(mean=[0.485, 0.456, 0.406],
+#                              std=[0.229, 0.224, 0.225]),
+#     ])
+#     return train_tf, eval_tf
 
 
 # -----------------------------
@@ -115,11 +116,12 @@ def confusion_matrix(targets, preds, num_classes: int):
 def main():
     torch.manual_seed(SEED)
 
-    train_tf, eval_tf = make_transforms(IMG_SIZE)
+    train_tf, eval_tf = make_dwrl_transforms(IMG_SIZE)
 
     train_ds = DWRLDataset(TRAIN_CSV, transform=train_tf)
     val_ds   = DWRLDataset(VAL_CSV,   transform=eval_tf)
     test_ds  = DWRLDataset(TEST_CSV,  transform=eval_tf)
+
 
     train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,  num_workers=NUM_WORKERS)
     val_loader   = DataLoader(val_ds,   batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS)

@@ -6,6 +6,7 @@ src/data/DWRL_extracted/
 src/data/DWRL_merged/
 **/DWRL*/
 **/dwrl*/
+src/data/splits/
 
 # =========================
 # ARCHIVES & ARTIFACTS
