@@ -66,6 +66,8 @@ def main():
     ap.add_argument("--val_csv", type=str, default=str(SPLITS_DIR / "val_plus_aug.csv"))
     ap.add_argument("--test_csv", type=str, default=str(SPLITS_DIR / "test.csv"))
     ap.add_argument("--no_val", action="store_true")
+    ap.add_argument("--early_round_patience", type=int, default=3)
+    ap.add_argument("--early_round_delta", type=float, default=0.2)  # in % points (0.2 = 0.2%)
 
         # CL / client split config
     ap.add_argument("--split_mode", choices=["equal", "dirichlet"], default="equal")
@@ -76,6 +78,9 @@ def main():
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
+
+    best_val = -1e9
+    bad_rounds = 0      
 
     device = pick_device(args.device)
     print(f"[Device] {device}", flush=True)
@@ -199,6 +204,17 @@ def main():
         acc_val = eval_acc(global_model, val_loader, device)
         acc_test = eval_acc(global_model, test_loader, device)
         print(f"[Round {r}] val_acc={acc_val:.2f}% test_acc={acc_test:.2f}%", flush=True)
+
+        # --- round-level early stopping on GLOBAL val_acc ---
+        if acc_val > best_val + args.early_round_delta:
+            best_val = acc_val
+            bad_rounds = 0
+        else:
+            bad_rounds += 1
+            print(f"[EarlyStop] no improv for {bad_rounds}/{args.early_round_patience} rounds (best_val={best_val:.2f}%)", flush=True)
+            if bad_rounds >= args.early_round_patience:
+                print(f"[EarlyStop] stopping at round {r} (best_val={best_val:.2f}%)", flush=True)
+                break
 
 
 if __name__ == "__main__":
