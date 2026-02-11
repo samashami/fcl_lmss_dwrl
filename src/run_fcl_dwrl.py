@@ -9,14 +9,20 @@ from torch.utils.data import DataLoader, Subset
 from torch import optim
 from torchvision import models
 from pathlib import Path
+import csv
+import json
+import pandas as pd
+
 
 from src.fl import Server, Client
 from src.strategies.replay import ReplayBuffer
 
 # use your single source of truth
-from src.data.dwrl_labels import NUM_CLASSES
+from src.data.dwrl_labels import NUM_CLASSES, IDX2CLASS
 from src.data.dwrl_dataset import DWRLDataset   # you created this earlier
 from src.data.dwrl_transforms import make_transforms  # must exist and return (train_tf, eval_tf)
+from src.policy_dwrl import V4ControllerDWRL
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SPLITS_DIR = REPO_ROOT / "src" / "data" / "splits"
@@ -39,6 +45,101 @@ def eval_acc(model, loader, device):
         correct += (pred == yb).sum().item()
         total += yb.numel()
     return 100.0 * correct / max(1, total)
+
+@torch.no_grad()
+def eval_acc_and_recall(model, loader, device, num_classes: int):
+    model.eval()
+    correct, total = 0, 0
+    hits = torch.zeros(num_classes, dtype=torch.long)
+    counts = torch.zeros(num_classes, dtype=torch.long)
+
+    for xb, yb in loader:
+        xb = xb.to(device, non_blocking=True)
+        yb = yb.to(device, non_blocking=True)
+        pred = model(xb).argmax(1)
+
+        correct += (pred == yb).sum().item()
+        total += yb.numel()
+
+        for c in range(num_classes):
+            m = (yb == c)
+            if m.any():
+                counts[c] += m.sum().item()
+                hits[c] += (pred[m] == c).sum().item()
+
+    acc = 100.0 * correct / max(1, total)
+    recall = (hits.float() / counts.clamp(min=1).float()).cpu().numpy()  # [0..1]
+    return acc, recall
+
+@torch.no_grad()
+def model_divergence_norm(global_model, client_models, device):
+    # simple scalar: std(dist) / median(dist)
+    # dist = L2 norm between flattened params
+    gvec = torch.cat([p.detach().to(device).flatten() for p in global_model.parameters()])
+    dists = []
+    for m in client_models:
+        cvec = torch.cat([p.detach().to(device).flatten() for p in m.parameters()])
+        d = torch.norm(cvec - gvec, p=2).item()
+        dists.append(d)
+    if len(dists) < 2:
+        return 0.0
+    med = float(np.median(dists)) + 1e-8
+    return float(np.std(dists) / med)
+
+
+@torch.no_grad()
+def predict(model, loader, device):
+    model.eval()
+    ys, ps = [], []
+    for xb, yb in loader:
+        xb = xb.to(device, non_blocking=True)
+        logits = model(xb)
+        pred = logits.argmax(1).cpu().tolist()
+        ps.extend(pred)
+        ys.extend(yb.tolist())
+    return ys, ps
+
+def confusion_matrix_np(y_true, y_pred, n):
+    cm = np.zeros((n, n), dtype=int)
+    for t, p in zip(y_true, y_pred):
+        cm[t, p] += 1
+    return cm
+
+def save_artifacts(run_dir: Path, args, global_model, val_acc_pct: float, test_acc_pct: float, test_loader, device):
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    # 1) save global model
+    ckpt = {
+        "state_dict": global_model.state_dict(),
+        "args": vars(args),
+        "val_acc_pct": float(val_acc_pct),
+        "test_acc_pct": float(test_acc_pct),
+    }
+    torch.save(ckpt, run_dir / "global_model.pt")
+
+    # 2) save args
+    (run_dir / "args.json").write_text(json.dumps(vars(args), indent=2))
+
+    # 3) per-class acc + confusion on TEST
+    y_true, y_pred = predict(global_model, test_loader, device)
+
+    # per-class accuracy (not recall) on TEST
+    percls = {}
+    y_true_np = np.asarray(y_true)
+    y_pred_np = np.asarray(y_pred)
+    for i in range(NUM_CLASSES):
+        m = (y_true_np == i)
+        percls[IDX2CLASS[i]] = float((y_pred_np[m] == i).mean()) if m.any() else float("nan")
+    (run_dir / "per_class_acc.json").write_text(json.dumps(percls, indent=2))
+
+    cm = confusion_matrix_np(y_true, y_pred, NUM_CLASSES)
+    np.save(run_dir / "confusion.npy", cm)
+
+    # also CSV
+    df_cm = pd.DataFrame(cm,
+                         index=[IDX2CLASS[i] for i in range(NUM_CLASSES)],
+                         columns=[IDX2CLASS[i] for i in range(NUM_CLASSES)])
+    df_cm.to_csv(run_dir / "confusion.csv")
 
 
 def pick_device(name: str):
@@ -68,8 +169,11 @@ def main():
     ap.add_argument("--no_val", action="store_true")
     ap.add_argument("--early_round_patience", type=int, default=3)
     ap.add_argument("--early_round_delta", type=float, default=0.2)  # in % points (0.2 = 0.2%)
+    ap.add_argument("--controller", choices=["fixed", "v4"], default="fixed")
+    ap.add_argument("--log_csv", type=str, default="")  # if empty -> run_dir/round_logs.csv
+    ap.add_argument("--run_dir", type=str, default="")  # where to save ckpt/metrics
 
-        # CL / client split config
+    # CL / client split config
     ap.add_argument("--split_mode", choices=["equal", "dirichlet"], default="equal")
     ap.add_argument("--alpha", type=float, default=0.2)
     ap.add_argument("--cl_batches", type=int, default=5)
@@ -159,20 +263,65 @@ def main():
             early_patience=2,
         ))
         print(f"[InitSplit] client {cid}: batch1={len(subset)} (of total {sum(len(b) for b in cl_schedule[cid])})", flush=True)
-        server = Server(device=device)
+    server = Server(device=device)
 
     # init global
     global_model = server.average([c.model for c in clients])
     base = eval_acc(global_model, test_loader, device)
     print(f"[Init] test_acc={base:.2f}%", flush=True)
 
+
+    # logging
+    run_dir = Path(args.run_dir) if args.run_dir else (Path("runs") / f"fcl_seed{args.seed}")
+    run_dir.mkdir(parents=True, exist_ok=True)
+    log_csv = Path(args.log_csv) if args.log_csv else (run_dir / "round_logs.csv")
+
+    round_rows = []
+    best_recall = np.zeros(NUM_CLASSES, dtype=np.float32)
+
+    # controller state (fractions, not %)
+    last_acc = None            # last test acc (0..1)
+    last_val_loss = None       # optional (we don't compute global loss right now)
+    last_forget_mean = 0.0
+    last_divergence = 0.0
+
+    v4 = None
+
+    if args.controller == "v4":
+        v4 = V4ControllerDWRL(base_lr=args.lr, base_rep=args.replay_ratio)
+
+    prev_acc = None
     for r in range(args.rounds):
+
+        # -------- controller decision (GLOBAL) --------
+        if args.controller == "v4":
+            hp = v4.step(
+                round_id=r,
+                acc=last_acc,
+                last_acc=prev_acc,
+                global_val_loss=last_val_loss,
+                forget_mean=last_forget_mean,
+                divergence=last_divergence,
+            )
+        else:
+            hp = {
+                "lr": args.lr,
+                "replay_ratio": args.replay_ratio,
+                "notes": "fixed",
+            }
+
+        print(
+            f"[HP r={r}] controller={args.controller} "
+            f"lr={hp['lr']:.6f} replay={hp['replay_ratio']:.2f} "
+            f"({hp['notes']})",
+            flush=True,
+        )
         # broadcast
         for c in clients:
             c.load_state_from(global_model)
 
 
-         # ✅ set current CL batch loader for this round (BEFORE training)
+        # ✅ set current CL batch loader for this round (BEFORE training)
         b_id = min(r, args.cl_batches - 1)  # safe if rounds > cl_batches
         for c in clients:
             batch_idx = cl_schedule[c.cid][b_id]
@@ -191,7 +340,7 @@ def main():
         for c in clients:
             for e in range(args.epochs):
                 _, _, stop = c.train_one_epoch(
-                    replay_ratio=args.replay_ratio,
+                    replay_ratio=hp["replay_ratio"],
                     epoch=e,
                     total_epochs=args.epochs,
                     log_interval=200,
@@ -201,9 +350,41 @@ def main():
 
         # aggregate
         global_model = server.average([c.model for c in clients])
+
+        # val acc (percent)
         acc_val = eval_acc(global_model, val_loader, device)
-        acc_test = eval_acc(global_model, test_loader, device)
-        print(f"[Round {r}] val_acc={acc_val:.2f}% test_acc={acc_test:.2f}%", flush=True)
+
+        # test acc + per-class recall
+        acc_test_pct, per_class_recall = eval_acc_and_recall(global_model, test_loader, device, NUM_CLASSES)
+
+        # forgetting (mean)
+        forgetting = np.maximum(0.0, best_recall - per_class_recall)
+        best_recall = np.maximum(best_recall, per_class_recall)
+        forget_mean = float(np.mean(forgetting))
+
+        # divergence (scalar)
+        div_norm = model_divergence_norm(global_model, [c.model for c in clients], device)
+
+        print(f"[Round {r}] val_acc={acc_val:.2f}% test_acc={acc_test_pct:.2f}% forget_mean={forget_mean:.4f} div={div_norm:.4f}", flush=True)
+
+        # update history for controller (fractions)
+        prev_acc = last_acc
+        last_acc = float(acc_test_pct / 100.0)
+        last_forget_mean = float(forget_mean)
+        last_divergence = float(div_norm)
+
+        # csv row
+        round_rows.append({
+            "round": int(r),
+            "controller": str(args.controller),
+            "lr": float(hp["lr"]),
+            "replay_ratio": float(hp["replay_ratio"]),
+            "val_acc_pct": float(acc_val),
+            "test_acc_pct": float(acc_test_pct),
+            "forget_mean": float(forget_mean),
+            "divergence": float(div_norm),
+            "notes": str(hp.get("notes", "")),
+        })
 
         # --- round-level early stopping on GLOBAL val_acc ---
         if acc_val > best_val + args.early_round_delta:
@@ -215,6 +396,22 @@ def main():
             if bad_rounds >= args.early_round_patience:
                 print(f"[EarlyStop] stopping at round {r} (best_val={best_val:.2f}%)", flush=True)
                 break
+
+
+    # write round logs
+    with open(log_csv, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=list(round_rows[0].keys()) if round_rows else ["round"])
+        w.writeheader()
+        for row in round_rows:
+            w.writerow(row)
+    print(f"[Saved] round_logs.csv -> {log_csv}", flush=True)
+
+    # final artifacts (model + per-class + confusion)
+    # use last computed accs if available, otherwise evaluate once
+    final_val = eval_acc(global_model, val_loader, device)
+    final_test, _ = eval_acc_and_recall(global_model, test_loader, device, NUM_CLASSES)
+    save_artifacts(run_dir, args, global_model, final_val, final_test, test_loader, device)
+    print(f"[Saved] {run_dir}/global_model.pt + per_class_acc.json + confusion.csv", flush=True)
 
 
 if __name__ == "__main__":
