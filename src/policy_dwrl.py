@@ -44,10 +44,9 @@ class V4ControllerDWRL:
              divergence: float) -> dict:
         """
         Returns dict with:
-          - lr, replay_ratio
-          - lr_req, rep_req
-          - lr_applied (= lr), rep_applied (= replay_ratio)
-          - clamped_lr, clamped_rep
+          - applied: lr, replay_ratio
+          - requested (pre-clamp): lr_req, replay_req
+          - flags: clamped_lr, clamped_rep
           - notes
         acc: global test acc in [0,1] (fraction)
         forget_mean: mean forgetting in [0,1]
@@ -94,16 +93,16 @@ class V4ControllerDWRL:
 
         # Requested (pre-clamp) values
         lr_req = float(lr)
-        rep_req = float(rep)
+        replay_req = float(rep)
 
         # Clamp and track whether requests were clipped
         lr = max(cfg.lr_min, min(cfg.lr_max, lr_req))
-        rep = max(cfg.rep_min, min(cfg.rep_max, rep_req))
+        rep = max(cfg.rep_min, min(cfg.rep_max, replay_req))
         clamped_lr = (lr != lr_req)
-        clamped_rep = (rep != rep_req)
+        clamped_rep = (rep != replay_req)
         notes.append(f"clamp(lr∈[{cfg.lr_min},{cfg.lr_max}], rep∈[{cfg.rep_min},{cfg.rep_max}])")
         notes.append(
-            f"req->applied(lr:{lr_req:.6g}->{lr:.6g}, rep:{rep_req:.6g}->{rep:.6g})"
+            f"req->applied(lr:{lr_req:.6g}->{lr:.6g}, rep:{replay_req:.6g}->{rep:.6g})"
         )
 
         self.last_lr = float(lr)
@@ -113,9 +112,7 @@ class V4ControllerDWRL:
             "lr": float(lr),
             "replay_ratio": float(rep),
             "lr_req": float(lr_req),
-            "rep_req": float(rep_req),
-            "lr_applied": float(lr),
-            "rep_applied": float(rep),
+            "replay_req": float(replay_req),
             "clamped_lr": bool(clamped_lr),
             "clamped_rep": bool(clamped_rep),
             "notes": " | ".join(notes),

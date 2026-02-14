@@ -182,6 +182,8 @@ def main():
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
 
     best_val = -1e9
     bad_rounds = 0      
@@ -280,8 +282,9 @@ def main():
     best_recall = np.zeros(NUM_CLASSES, dtype=np.float32)
 
     # controller state (fractions, not %)
-    last_acc = None            # last test acc (0..1)
-    last_val_loss = None       # optional (we don't compute global loss right now)
+    # ctrl_acc_curr: most recent test acc fraction; ctrl_acc_prev: one step before that.
+    ctrl_acc_curr = None
+    ctrl_acc_prev = None
     last_forget_mean = 0.0
     last_divergence = 0.0
 
@@ -289,17 +292,15 @@ def main():
 
     if args.controller == "v4":
         v4 = V4ControllerDWRL(base_lr=args.lr, base_rep=args.replay_ratio)
-
-    prev_acc = None
     for r in range(args.rounds):
 
         # -------- controller decision (GLOBAL) --------
         if args.controller == "v4":
             hp = v4.step(
                 round_id=r,
-                acc=last_acc,
-                last_acc=prev_acc,
-                global_val_loss=last_val_loss,
+                acc=float(ctrl_acc_curr) if ctrl_acc_curr is not None else 0.0,
+                last_acc=ctrl_acc_prev,
+                global_val_loss=None,
                 forget_mean=last_forget_mean,
                 divergence=last_divergence,
             )
@@ -307,18 +308,28 @@ def main():
             hp = {
                 "lr": args.lr,
                 "replay_ratio": args.replay_ratio,
+                "lr_req": args.lr,
+                "replay_req": args.replay_ratio,
+                "clamped_lr": False,
+                "clamped_rep": False,
                 "notes": "fixed",
             }
 
         print(
             f"[HP r={r}] controller={args.controller} "
             f"lr={hp['lr']:.6f} replay={hp['replay_ratio']:.2f} "
+            f"(req_lr={hp.get('lr_req', hp['lr']):.6f}, "
+            f"req_rep={hp.get('replay_req', hp['replay_ratio']):.2f}, "
+            f"clamped_lr={bool(hp.get('clamped_lr', False))}, "
+            f"clamped_rep={bool(hp.get('clamped_rep', False))}) "
             f"({hp['notes']})",
             flush=True,
         )
         # broadcast
         for c in clients:
             c.load_state_from(global_model)
+            for pg in c.optimizer.param_groups:
+                pg["lr"] = float(hp["lr"])
 
 
         # ✅ set current CL batch loader for this round (BEFORE training)
@@ -368,8 +379,8 @@ def main():
         print(f"[Round {r}] val_acc={acc_val:.2f}% test_acc={acc_test_pct:.2f}% forget_mean={forget_mean:.4f} div={div_norm:.4f}", flush=True)
 
         # update history for controller (fractions)
-        prev_acc = last_acc
-        last_acc = float(acc_test_pct / 100.0)
+        ctrl_acc_prev = ctrl_acc_curr
+        ctrl_acc_curr = float(acc_test_pct / 100.0)
         last_forget_mean = float(forget_mean)
         last_divergence = float(div_norm)
 
@@ -379,6 +390,10 @@ def main():
             "controller": str(args.controller),
             "lr": float(hp["lr"]),
             "replay_ratio": float(hp["replay_ratio"]),
+            "lr_req": float(hp.get("lr_req", hp["lr"])),
+            "replay_req": float(hp.get("replay_req", hp["replay_ratio"])),
+            "clamped_lr": bool(hp.get("clamped_lr", False)),
+            "clamped_rep": bool(hp.get("clamped_rep", False)),
             "val_acc_pct": float(acc_val),
             "test_acc_pct": float(acc_test_pct),
             "forget_mean": float(forget_mean),
