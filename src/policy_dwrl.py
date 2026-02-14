@@ -5,9 +5,9 @@ import numpy as np
 
 @dataclass
 class V4Config:
-    lr_min: float = 1e-4
+    lr_min: float = 5e-5
     lr_max: float = 2e-3
-    rep_min: float = 0.20
+    rep_min: float = 0.10
     rep_max: float = 0.70
 
     deadband: float = 0.003
@@ -43,7 +43,12 @@ class V4ControllerDWRL:
              forget_mean: float,
              divergence: float) -> dict:
         """
-        Returns dict: {"lr": float, "replay_ratio": float, "notes": str}
+        Returns dict with:
+          - lr, replay_ratio
+          - lr_req, rep_req
+          - lr_applied (= lr), rep_applied (= replay_ratio)
+          - clamped_lr, clamped_rep
+          - notes
         acc: global test acc in [0,1] (fraction)
         forget_mean: mean forgetting in [0,1]
         divergence: scalar (0..~) normalized
@@ -87,12 +92,31 @@ class V4ControllerDWRL:
                     lr *= cfg.lr_boost
                     notes.append("lr↑(loss high & improving)")
 
-        # Clamp
-        lr = max(cfg.lr_min, min(cfg.lr_max, lr))
-        rep = max(cfg.rep_min, min(cfg.rep_max, rep))
+        # Requested (pre-clamp) values
+        lr_req = float(lr)
+        rep_req = float(rep)
+
+        # Clamp and track whether requests were clipped
+        lr = max(cfg.lr_min, min(cfg.lr_max, lr_req))
+        rep = max(cfg.rep_min, min(cfg.rep_max, rep_req))
+        clamped_lr = (lr != lr_req)
+        clamped_rep = (rep != rep_req)
         notes.append(f"clamp(lr∈[{cfg.lr_min},{cfg.lr_max}], rep∈[{cfg.rep_min},{cfg.rep_max}])")
+        notes.append(
+            f"req->applied(lr:{lr_req:.6g}->{lr:.6g}, rep:{rep_req:.6g}->{rep:.6g})"
+        )
 
         self.last_lr = float(lr)
         self.last_rep = float(rep)
 
-        return {"lr": float(lr), "replay_ratio": float(rep), "notes": " | ".join(notes)}
+        return {
+            "lr": float(lr),
+            "replay_ratio": float(rep),
+            "lr_req": float(lr_req),
+            "rep_req": float(rep_req),
+            "lr_applied": float(lr),
+            "rep_applied": float(rep),
+            "clamped_lr": bool(clamped_lr),
+            "clamped_rep": bool(clamped_rep),
+            "notes": " | ".join(notes),
+        }

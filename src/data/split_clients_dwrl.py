@@ -88,7 +88,7 @@ def make_cl_schedule(
     Build continual-learning (CL) schedule per client.
     Returns:
       cl_schedule[cid][r] = np.ndarray of indices for round r (new data only)
-
+.
     Strategy:
       - shuffle each client's indices with (seed + cid)
       - first batch gets ~init_frac of data (like CIFAR script)
