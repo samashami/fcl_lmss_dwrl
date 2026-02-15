@@ -38,7 +38,7 @@ class V4ControllerDWRL:
         self.last_rep = float(base_rep)
         self.ema_loss = None  # set on first step
 
-    def step(self, round_id: int, acc: float, last_acc: float | None,
+    def step(self, round_id: int, acc_curr: float, acc_prev: float | None,
              global_val_loss: float | None,
              forget_mean: float,
              divergence: float) -> dict:
@@ -48,12 +48,13 @@ class V4ControllerDWRL:
           - requested (pre-clamp): lr_req, replay_req
           - flags: clamped_lr, clamped_rep
           - notes
-        acc: global test acc in [0,1] (fraction)
+        acc_curr: current global test acc in [0,1] (fraction)
+        acc_prev: previous global test acc in [0,1] (fraction) or None
         forget_mean: mean forgetting in [0,1]
         divergence: scalar (0..~) normalized
         """
         cfg = self.cfg
-        dacc = 0.0 if last_acc is None else float(acc - last_acc)
+        dacc = 0.0 if acc_prev is None else float(acc_curr - acc_prev)
 
         # EMA loss (optional)
         if global_val_loss is not None and np.isfinite(global_val_loss):

@@ -22,6 +22,15 @@ from src.data.dwrl_labels import NUM_CLASSES, IDX2CLASS
 from src.data.dwrl_dataset import DWRLDataset   # you created this earlier
 from src.data.dwrl_transforms import make_transforms  # must exist and return (train_tf, eval_tf)
 from src.policy_dwrl import V4ControllerDWRL
+from src.policy import (
+    build_controller_state_dwrl,
+    compact_state_for_lmss_dwrl,
+    lmss_decide_action_api_dwrl,
+    lmss_decide_action_local_dwrl,
+    validate_action_dwrl,
+    write_action_json,
+    write_state_json,
+)
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -169,7 +178,8 @@ def main():
     ap.add_argument("--no_val", action="store_true")
     ap.add_argument("--early_round_patience", type=int, default=3)
     ap.add_argument("--early_round_delta", type=float, default=0.2)  # in % points (0.2 = 0.2%)
-    ap.add_argument("--controller", choices=["fixed", "v4"], default="fixed")
+    ap.add_argument("--controller", choices=["fixed", "v4", "lmss_local", "lmss_api"], default="fixed")
+    ap.add_argument("--lmss_model", type=str, default="Qwen/Qwen2.5-0.5B-Instruct")
     ap.add_argument("--log_csv", type=str, default="")  # if empty -> run_dir/round_logs.csv
     ap.add_argument("--run_dir", type=str, default="")  # where to save ckpt/metrics
 
@@ -279,49 +289,91 @@ def main():
     log_csv = Path(args.log_csv) if args.log_csv else (run_dir / "round_logs.csv")
 
     round_rows = []
-    best_recall = np.zeros(NUM_CLASSES, dtype=np.float32)
+    client_rows = []
+    best_recall_val = np.zeros(NUM_CLASSES, dtype=np.float32)
 
-    # controller state (fractions, not %)
-    # ctrl_acc_curr: most recent test acc fraction; ctrl_acc_prev: one step before that.
-    ctrl_acc_curr = None
-    ctrl_acc_prev = None
+    io_root = run_dir / "controller_io"
+    io_root.mkdir(parents=True, exist_ok=True)
+
+    # controller state (train/val-only signals)
+    val_acc_curr = None
+    val_acc_prev = None
+    val_loss_curr = None
     last_forget_mean = 0.0
     last_divergence = 0.0
+    last_lr_applied = float(args.lr)
+    last_rep_applied = float(args.replay_ratio)
 
     v4 = None
 
     if args.controller == "v4":
         v4 = V4ControllerDWRL(base_lr=args.lr, base_rep=args.replay_ratio)
     for r in range(args.rounds):
+        client_snaps = []
+        for c in clients:
+            batches = cl_schedule[c.cid]
+            nb = len(batches[min(r, len(batches) - 1)])
+            lr_snapshot = float(c.optimizer.param_groups[0]["lr"]) if c.optimizer.param_groups else float(args.lr)
+            client_snaps.append(
+                {
+                    "id": int(c.cid),
+                    "vloss": float(getattr(c, "_last_vloss", float("nan"))),
+                    "vacc": float(getattr(c, "_last_vacc", float("nan"))),
+                    "new_batch_size": int(nb),
+                    "last_lr": float(lr_snapshot),
+                    "last_replay_ratio": float(last_rep_applied),
+                }
+            )
+
+        state = build_controller_state_dwrl(
+            round_id=r,
+            val_acc_curr=val_acc_curr,
+            val_acc_prev=val_acc_prev,
+            val_loss=val_loss_curr,
+            forget_mean=last_forget_mean,
+            divergence=last_divergence,
+            clients=client_snaps,
+        )
+        write_state_json(io_root, r, state)
 
         # -------- controller decision (GLOBAL) --------
         if args.controller == "v4":
-            hp = v4.step(
+            raw_action = v4.step(
                 round_id=r,
-                acc=float(ctrl_acc_curr) if ctrl_acc_curr is not None else 0.0,
-                last_acc=ctrl_acc_prev,
-                global_val_loss=None,
+                acc_curr=float(val_acc_curr) if val_acc_curr is not None else 0.0,
+                acc_prev=val_acc_prev,
+                global_val_loss=val_loss_curr,
                 forget_mean=last_forget_mean,
                 divergence=last_divergence,
             )
+            raw_action["policy_source"] = "V4"
+        elif args.controller == "lmss_local":
+            raw_action = lmss_decide_action_local_dwrl(
+                state=state,
+                compact_state_fn=compact_state_for_lmss_dwrl,
+                model_name=args.lmss_model,
+            )
+        elif args.controller == "lmss_api":
+            raw_action = lmss_decide_action_api_dwrl(
+                state=state,
+                compact_state_fn=compact_state_for_lmss_dwrl,
+                model="gpt-4o-mini",
+            )
         else:
-            hp = {
-                "lr": args.lr,
-                "replay_ratio": args.replay_ratio,
+            raw_action = {
                 "lr_req": args.lr,
                 "replay_req": args.replay_ratio,
-                "clamped_lr": False,
-                "clamped_rep": False,
                 "notes": "fixed",
+                "policy_source": "Fixed",
             }
+        hp = validate_action_dwrl(raw_action, policy_source=str(raw_action.get("policy_source", args.controller)))
+        write_action_json(io_root, r, hp, policy_source=str(hp.get("policy_source", args.controller)))
 
         print(
             f"[HP r={r}] controller={args.controller} "
-            f"lr={hp['lr']:.6f} replay={hp['replay_ratio']:.2f} "
-            f"(req_lr={hp.get('lr_req', hp['lr']):.6f}, "
-            f"req_rep={hp.get('replay_req', hp['replay_ratio']):.2f}, "
-            f"clamped_lr={bool(hp.get('clamped_lr', False))}, "
-            f"clamped_rep={bool(hp.get('clamped_rep', False))}) "
+            f"req_lr={hp['lr_req']:.6f}->applied={hp['lr_applied']:.6f} "
+            f"req_rep={hp['rep_req']:.2f}->applied={hp['replay_applied']:.2f} "
+            f"(clamped_lr={hp['clamped_lr']}, clamped_rep={hp['clamped_rep']}) "
             f"({hp['notes']})",
             flush=True,
         )
@@ -329,7 +381,7 @@ def main():
         for c in clients:
             c.load_state_from(global_model)
             for pg in c.optimizer.param_groups:
-                pg["lr"] = float(hp["lr"])
+                pg["lr"] = float(hp["lr_applied"])
 
 
         # ✅ set current CL batch loader for this round (BEFORE training)
@@ -351,59 +403,81 @@ def main():
         for c in clients:
             for e in range(args.epochs):
                 _, _, stop = c.train_one_epoch(
-                    replay_ratio=hp["replay_ratio"],
+                    replay_ratio=hp["replay_applied"],
                     epoch=e,
                     total_epochs=args.epochs,
                     log_interval=200,
                 )
+                client_rows.append({
+                    "round": int(r),
+                    "client": int(c.cid),
+                    "epoch": int(e + 1),
+                    "lr_applied": float(c.optimizer.param_groups[0]["lr"]),
+                    "replay_applied": float(hp["replay_applied"]),
+                    "val_loss": float(getattr(c, "_last_vloss", float("nan"))),
+                    "val_acc": float(getattr(c, "_last_vacc", float("nan"))),
+                })
                 if stop:
                     break
 
         # aggregate
         global_model = server.average([c.model for c in clients])
 
-        # val acc (percent)
-        acc_val = eval_acc(global_model, val_loader, device)
+        # val metrics (controller-relevant)
+        acc_val_pct, per_class_recall_val = eval_acc_and_recall(global_model, val_loader, device, NUM_CLASSES)
+        val_losses = [
+            float(getattr(c, "_last_vloss", float("nan")))
+            for c in clients
+            if np.isfinite(float(getattr(c, "_last_vloss", float("nan"))))
+        ]
+        val_loss_curr = float(np.mean(val_losses)) if val_losses else None
 
-        # test acc + per-class recall
-        acc_test_pct, per_class_recall = eval_acc_and_recall(global_model, test_loader, device, NUM_CLASSES)
+        # test metrics (reporting only)
+        acc_test_pct = eval_acc(global_model, test_loader, device)
 
-        # forgetting (mean)
-        forgetting = np.maximum(0.0, best_recall - per_class_recall)
-        best_recall = np.maximum(best_recall, per_class_recall)
+        # forgetting from validation recall (avoid test leakage)
+        forgetting = np.maximum(0.0, best_recall_val - per_class_recall_val)
+        best_recall_val = np.maximum(best_recall_val, per_class_recall_val)
         forget_mean = float(np.mean(forgetting))
 
         # divergence (scalar)
         div_norm = model_divergence_norm(global_model, [c.model for c in clients], device)
 
-        print(f"[Round {r}] val_acc={acc_val:.2f}% test_acc={acc_test_pct:.2f}% forget_mean={forget_mean:.4f} div={div_norm:.4f}", flush=True)
+        print(
+            f"[Round {r}] val_acc={acc_val_pct:.2f}% test_acc={acc_test_pct:.2f}% "
+            f"forget_mean={forget_mean:.4f} div={div_norm:.4f}",
+            flush=True,
+        )
 
-        # update history for controller (fractions)
-        ctrl_acc_prev = ctrl_acc_curr
-        ctrl_acc_curr = float(acc_test_pct / 100.0)
+        # update history for controller (fractions, val only)
+        val_acc_prev = val_acc_curr
+        val_acc_curr = float(acc_val_pct / 100.0)
         last_forget_mean = float(forget_mean)
         last_divergence = float(div_norm)
+        last_lr_applied = float(hp["lr_applied"])
+        last_rep_applied = float(hp["replay_applied"])
 
         # csv row
         round_rows.append({
             "round": int(r),
             "controller": str(args.controller),
-            "lr": float(hp["lr"]),
-            "replay_ratio": float(hp["replay_ratio"]),
-            "lr_req": float(hp.get("lr_req", hp["lr"])),
-            "replay_req": float(hp.get("replay_req", hp["replay_ratio"])),
-            "clamped_lr": bool(hp.get("clamped_lr", False)),
-            "clamped_rep": bool(hp.get("clamped_rep", False)),
-            "val_acc_pct": float(acc_val),
+            "lr_applied": float(hp["lr_applied"]),
+            "replay_applied": float(hp["replay_applied"]),
+            "lr_req": float(hp["lr_req"]),
+            "rep_req": float(hp["rep_req"]),
+            "clamped_lr": bool(hp["clamped_lr"]),
+            "clamped_rep": bool(hp["clamped_rep"]),
+            "val_acc_pct": float(acc_val_pct),
             "test_acc_pct": float(acc_test_pct),
             "forget_mean": float(forget_mean),
             "divergence": float(div_norm),
-            "notes": str(hp.get("notes", "")),
+            "notes": str(hp["notes"]),
+            "policy_source": str(hp.get("policy_source", args.controller)),
         })
 
         # --- round-level early stopping on GLOBAL val_acc ---
-        if acc_val > best_val + args.early_round_delta:
-            best_val = acc_val
+        if acc_val_pct > best_val + args.early_round_delta:
+            best_val = acc_val_pct
             bad_rounds = 0
         else:
             bad_rounds += 1
@@ -420,6 +494,15 @@ def main():
         for row in round_rows:
             w.writerow(row)
     print(f"[Saved] round_logs.csv -> {log_csv}", flush=True)
+
+    if client_rows:
+        client_log_csv = run_dir / "client_logs.csv"
+        with open(client_log_csv, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=list(client_rows[0].keys()))
+            w.writeheader()
+            for row in client_rows:
+                w.writerow(row)
+        print(f"[Saved] client_logs.csv -> {client_log_csv}", flush=True)
 
     # final artifacts (model + per-class + confusion)
     # use last computed accs if available, otherwise evaluate once
