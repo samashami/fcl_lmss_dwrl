@@ -303,6 +303,8 @@ def main():
     last_divergence = 0.0
     last_lr_applied = float(args.lr)
     last_rep_applied = float(args.replay_ratio)
+    last_per_class_val_recall = {IDX2CLASS[i]: 0.0 for i in range(NUM_CLASSES)}
+    action_history: list[dict] = []
 
     v4 = None
 
@@ -332,6 +334,8 @@ def main():
             val_loss=val_loss_curr,
             forget_mean=last_forget_mean,
             divergence=last_divergence,
+            per_class_val_recall=last_per_class_val_recall,
+            last_2_actions=action_history[-2:],
             clients=client_snaps,
         )
         write_state_json(io_root, r, state)
@@ -368,6 +372,15 @@ def main():
             }
         hp = validate_action_dwrl(raw_action, policy_source=str(raw_action.get("policy_source", args.controller)))
         write_action_json(io_root, r, hp, policy_source=str(hp.get("policy_source", args.controller)))
+        action_history.append(
+            {
+                "round": int(r),
+                "policy_source": str(hp.get("policy_source", args.controller)),
+                "lr_applied": float(hp["lr_applied"]),
+                "replay_applied": float(hp["replay_applied"]),
+                "notes": str(hp["notes"]),
+            }
+        )
 
         print(
             f"[HP r={r}] controller={args.controller} "
@@ -439,6 +452,9 @@ def main():
         forgetting = np.maximum(0.0, best_recall_val - per_class_recall_val)
         best_recall_val = np.maximum(best_recall_val, per_class_recall_val)
         forget_mean = float(np.mean(forgetting))
+        last_per_class_val_recall = {
+            IDX2CLASS[i]: float(per_class_recall_val[i]) for i in range(NUM_CLASSES)
+        }
 
         # divergence (scalar)
         div_norm = model_divergence_norm(global_model, [c.model for c in clients], device)

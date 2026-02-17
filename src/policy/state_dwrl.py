@@ -10,17 +10,25 @@ def build_controller_state_dwrl(
     val_loss: float | None,
     forget_mean: float,
     divergence: float,
+    per_class_val_recall: Dict[str, float] | None,
+    last_2_actions: List[Dict[str, Any]] | None,
     clients: List[Dict[str, Any]],
 ) -> Dict[str, Any]:
+    dval = None
+    if val_acc_curr is not None and val_acc_prev is not None:
+        dval = float(val_acc_curr - val_acc_prev)
     return {
         "round_id": int(round_id),
         "global": {
             "val_acc_curr": float(val_acc_curr) if val_acc_curr is not None else None,
             "val_acc_prev": float(val_acc_prev) if val_acc_prev is not None else None,
+            "dval_acc": dval,
             "val_loss": float(val_loss) if val_loss is not None else None,
             "forget_mean": float(forget_mean),
             "divergence": float(divergence),
+            "per_class_val_recall": dict(per_class_val_recall or {}),
         },
+        "last_2_actions": list(last_2_actions or []),
         "clients": clients,
     }
 
@@ -32,10 +40,13 @@ def compact_state_for_lmss_dwrl(state: Dict[str, Any]) -> Dict[str, Any]:
         "global": {
             "val_acc_curr": g.get("val_acc_curr"),
             "val_acc_prev": g.get("val_acc_prev"),
+            "dval_acc": g.get("dval_acc"),
             "val_loss": g.get("val_loss"),
             "forget_mean": g.get("forget_mean", 0.0),
             "divergence": g.get("divergence", 0.0),
+            "per_class_val_recall": g.get("per_class_val_recall", {}),
         },
+        "last_2_actions": state.get("last_2_actions", []),
         "clients": [],
     }
     for c in state.get("clients", []):
@@ -50,4 +61,3 @@ def compact_state_for_lmss_dwrl(state: Dict[str, Any]) -> Dict[str, Any]:
             }
         )
     return out
-
