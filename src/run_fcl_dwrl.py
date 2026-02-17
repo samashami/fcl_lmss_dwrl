@@ -305,6 +305,7 @@ def main():
     last_rep_applied = float(args.replay_ratio)
     last_per_class_val_recall = {IDX2CLASS[i]: 0.0 for i in range(NUM_CLASSES)}
     action_history: list[dict] = []
+    dacc_hist: list[float] = []
 
     v4 = None
 
@@ -335,7 +336,8 @@ def main():
             forget_mean=last_forget_mean,
             divergence=last_divergence,
             per_class_val_recall=last_per_class_val_recall,
-            last_2_actions=action_history[-2:],
+            last_2_actions=[int(x.get("strategy_id", 0)) for x in action_history[-2:]],
+            dacc_hist=dacc_hist[-2:],
             clients=client_snaps,
         )
         write_state_json(io_root, r, state)
@@ -375,6 +377,7 @@ def main():
         action_history.append(
             {
                 "round": int(r),
+                "strategy_id": int(str(hp.get("policy_source", "LMSS_LOCAL_0")).split("_")[-1]) if str(hp.get("policy_source", "")).startswith("LMSS_LOCAL_") else 0,
                 "policy_source": str(hp.get("policy_source", args.controller)),
                 "lr_applied": float(hp["lr_applied"]),
                 "replay_applied": float(hp["replay_applied"]),
@@ -468,6 +471,8 @@ def main():
         # update history for controller (fractions, val only)
         val_acc_prev = val_acc_curr
         val_acc_curr = float(acc_val_pct / 100.0)
+        if val_acc_prev is not None:
+            dacc_hist.append(float(val_acc_curr - val_acc_prev))
         last_forget_mean = float(forget_mean)
         last_divergence = float(div_norm)
         last_lr_applied = float(hp["lr_applied"])

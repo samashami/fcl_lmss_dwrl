@@ -12,6 +12,7 @@ def build_controller_state_dwrl(
     divergence: float,
     per_class_val_recall: Dict[str, float] | None,
     last_2_actions: List[Dict[str, Any]] | None,
+    dacc_hist: List[float] | None,
     clients: List[Dict[str, Any]],
 ) -> Dict[str, Any]:
     dval = None
@@ -27,6 +28,7 @@ def build_controller_state_dwrl(
             "forget_mean": float(forget_mean),
             "divergence": float(divergence),
             "per_class_val_recall": dict(per_class_val_recall or {}),
+            "dacc_hist": list(dacc_hist or []),
         },
         "last_2_actions": list(last_2_actions or []),
         "clients": clients,
@@ -45,6 +47,7 @@ def compact_state_for_lmss_dwrl(state: Dict[str, Any]) -> Dict[str, Any]:
             "forget_mean": g.get("forget_mean", 0.0),
             "divergence": g.get("divergence", 0.0),
             "per_class_val_recall": g.get("per_class_val_recall", {}),
+            "dacc_hist": g.get("dacc_hist", []),
         },
         "last_2_actions": state.get("last_2_actions", []),
         "clients": [],
