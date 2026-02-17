@@ -20,16 +20,57 @@ _CACHE: Dict[str, Any] = {"tok": None, "mdl": None, "model_name": None}
 _DEBUG = os.environ.get("LMSS_DEBUG", "1") == "1"
 
 
-def _extract_first_json_object(text: str) -> Optional[Dict[str, Any]]:
-    # Try all JSON-looking spans and pick the first valid one containing strategy_id.
-    for m in re.finditer(r"\{.*?\}", text, flags=re.DOTALL):
+def _parse_strategy_id(text: str, palette_size: int) -> tuple[Optional[int], str]:
+    """
+    Parse strategy id with explicit precedence:
+      1) strict JSON whole string
+      2) extracted JSON object (first '{' ... last '}')
+      3) constrained regex 'strategy_id: <int>'
+      4) single integer line
+    Returns (sid, parse_mode). sid=None means parse failure.
+    """
+    raw = (text or "").strip()
+    if not raw:
+        return None, "fallback"
+
+    # 1) strict JSON
+    try:
+        obj = json.loads(raw)
+        if isinstance(obj, dict) and "strategy_id" in obj:
+            sid = int(obj["strategy_id"])
+            if 0 <= sid < palette_size:
+                return sid, "json"
+    except Exception:
+        pass
+
+    # 2) extracted JSON from first '{' to last '}'
+    i = raw.find("{")
+    j = raw.rfind("}")
+    if i != -1 and j != -1 and j > i:
+        blob = raw[i : j + 1]
         try:
-            obj = json.loads(m.group(0).replace("\n", " ").strip())
-            if isinstance(obj, dict) and ("strategy_id" in obj):
-                return obj
+            obj = json.loads(blob)
+            if isinstance(obj, dict) and "strategy_id" in obj:
+                sid = int(obj["strategy_id"])
+                if 0 <= sid < palette_size:
+                    return sid, "extracted"
         except Exception:
-            continue
-    return None
+            pass
+
+    # 3) constrained 'strategy_id: <int>' pattern
+    m = re.search(r"\bstrategy_id\b\s*[:=]\s*(-?\d+)\b", raw, flags=re.IGNORECASE)
+    if m:
+        sid = int(m.group(1))
+        if 0 <= sid < palette_size:
+            return sid, "regex"
+
+    # 4) single integer line only
+    if re.fullmatch(r"\s*-?\d+\s*", raw):
+        sid = int(raw)
+        if 0 <= sid < palette_size:
+            return sid, "int_line"
+
+    return None, "fallback"
 
 
 def _build_action(strategy_id: int) -> Dict[str, Any]:
@@ -181,20 +222,18 @@ Return ONLY valid JSON on one line with no markdown:
     prompt_len = int(inputs["input_ids"].shape[1])
     gen_ids = out[0][prompt_len:]
     txt = tok.decode(gen_ids, skip_special_tokens=True)
+    sid, parse_mode = _parse_strategy_id(txt, palette_size=len(STRATEGY_PALETTE))
+    parse_fail = sid is None
     if _DEBUG:
-        print(f"[LMSS_DEBUG] generated='{txt[:220]}'", flush=True)
-    parsed = _extract_first_json_object(txt)
-    if _DEBUG:
-        print(f"[LMSS_DEBUG] parsed={parsed}", flush=True)
-    if not parsed or "strategy_id" not in parsed:
+        preview = txt.replace("\n", "\\n")
+        print(f"[LMSS_DEBUG] raw_llm_output='{preview[:300]}'", flush=True)
+        print(f"[LMSS_DEBUG] parse_mode={parse_mode} parse_fail={parse_fail} sid={sid}", flush=True)
+    if parse_fail:
         sid = _fallback_strategy(dval, forget_mean, div, dacc_hist, [int(x) for x in last_2_actions], pvc)
         action = _build_action(sid)
-        action["notes"] = f"{action['notes']} | fallback(parse)"
+        action["notes"] = f"{action['notes']} | parse_mode=fallback | parse_fail=True"
         return action
 
-    sid = int(parsed.get("strategy_id", 0))
     action = _build_action(sid)
-    reasoning = str(parsed.get("reason", parsed.get("reasoning", ""))).strip()
-    if reasoning:
-        action["notes"] = f"{action['notes']} | {reasoning}"
+    action["notes"] = f"{action['notes']} | parse_mode={parse_mode} | parse_fail=False"
     return action
