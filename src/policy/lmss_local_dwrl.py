@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from typing import Any, Dict, Optional
 
@@ -16,6 +17,7 @@ STRATEGY_PALETTE = {
 
 _DEFAULT_MODEL = "Qwen/Qwen2.5-0.5B-Instruct"
 _CACHE: Dict[str, Any] = {"tok": None, "mdl": None, "model_name": None}
+_DEBUG = os.environ.get("LMSS_DEBUG", "1") == "1"
 
 
 def _extract_first_json_object(text: str) -> Optional[Dict[str, Any]]:
@@ -38,6 +40,35 @@ def _build_action(strategy_id: int) -> Dict[str, Any]:
         "notes": f"LMSS_LOCAL strategy={int(strategy_id)}:{s['name']}",
         "policy_source": f"LMSS_LOCAL_{int(strategy_id)}",
     }
+
+def _fallback_strategy(
+    dval: float,
+    forget_mean: float,
+    div: float,
+    dacc_hist: list[float],
+    last_2_actions: list[int],
+    pvc: float,
+) -> int:
+    # Plateau: avoid repeating Hold if trend is non-positive and stable but stuck.
+    if (
+        len(dacc_hist) >= 2
+        and dacc_hist[-1] <= 0.0
+        and dacc_hist[-2] <= 0.0
+        and forget_mean < 0.05
+        and div < 0.10
+        and len(last_2_actions) >= 2
+        and int(last_2_actions[-1]) == 0
+        and int(last_2_actions[-2]) == 0
+    ):
+        return 1 if pvc < 0.70 else 2
+    # Mild correction if not improving.
+    if dval <= 0.0:
+        return 1
+    # Instability fallback.
+    if div > 0.10 or forget_mean > 0.05:
+        return 2
+    # Only hold when clearly stable/improving.
+    return 0
 
 
 def lmss_decide_action_local_dwrl(
@@ -77,7 +108,10 @@ def lmss_decide_action_local_dwrl(
         import torch
         from transformers import AutoModelForCausalLM, AutoTokenizer
     except Exception:
-        return _build_action(0)
+        sid = _fallback_strategy(dval, forget_mean, div, dacc_hist, [int(x) for x in last_2_actions], pvc)
+        action = _build_action(sid)
+        action["notes"] = f"{action['notes']} | fallback(no transformers)"
+        return action
 
     if (
         _CACHE["tok"] is None
@@ -147,9 +181,16 @@ Return ONLY valid JSON on one line with no markdown:
     prompt_len = int(inputs["input_ids"].shape[1])
     gen_ids = out[0][prompt_len:]
     txt = tok.decode(gen_ids, skip_special_tokens=True)
+    if _DEBUG:
+        print(f"[LMSS_DEBUG] generated='{txt[:220]}'", flush=True)
     parsed = _extract_first_json_object(txt)
+    if _DEBUG:
+        print(f"[LMSS_DEBUG] parsed={parsed}", flush=True)
     if not parsed or "strategy_id" not in parsed:
-        return _build_action(0)
+        sid = _fallback_strategy(dval, forget_mean, div, dacc_hist, [int(x) for x in last_2_actions], pvc)
+        action = _build_action(sid)
+        action["notes"] = f"{action['notes']} | fallback(parse)"
+        return action
 
     sid = int(parsed.get("strategy_id", 0))
     action = _build_action(sid)
