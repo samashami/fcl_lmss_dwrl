@@ -33,7 +33,20 @@ def _parse_strategy_id(text: str, palette_size: int) -> tuple[Optional[int], str
     if not raw:
         return None, "fallback"
 
-    # 1) strict JSON
+    # 1) single integer line only (preferred for integer-only contract)
+    if re.fullmatch(r"\s*-?\d+\s*", raw):
+        sid = int(raw)
+        if 0 <= sid < palette_size:
+            return sid, "int"
+
+    # 2) prose 'Strategy <int>' pattern (e.g., "Strategy 4")
+    m = re.search(r"\bstrategy\b[^0-9-]*(-?\d+)\b", raw, flags=re.IGNORECASE)
+    if m:
+        sid = int(m.group(1))
+        if 0 <= sid < palette_size:
+            return sid, "strategy_regex"
+
+    # 3) strict JSON
     try:
         obj = json.loads(raw)
         if isinstance(obj, dict) and "strategy_id" in obj:
@@ -43,7 +56,7 @@ def _parse_strategy_id(text: str, palette_size: int) -> tuple[Optional[int], str
     except Exception:
         pass
 
-    # 2) extracted JSON from first '{' to last '}'
+    # 4) extracted JSON from first '{' to last '}'
     i = raw.find("{")
     j = raw.rfind("}")
     if i != -1 and j != -1 and j > i:
@@ -57,18 +70,12 @@ def _parse_strategy_id(text: str, palette_size: int) -> tuple[Optional[int], str
         except Exception:
             pass
 
-    # 3) constrained 'strategy_id: <int>' pattern
+    # 5) constrained 'strategy_id: <int>' pattern
     m = re.search(r"\bstrategy_id\b\s*[:=]\s*(-?\d+)\b", raw, flags=re.IGNORECASE)
     if m:
         sid = int(m.group(1))
         if 0 <= sid < palette_size:
-            return sid, "regex"
-
-    # 4) single integer line only
-    if re.fullmatch(r"\s*-?\d+\s*", raw):
-        sid = int(raw)
-        if 0 <= sid < palette_size:
-            return sid, "int_line"
+            return sid, "key_regex"
 
     return None, "fallback"
 
@@ -205,11 +212,26 @@ STATE (JSON):
 STRATEGY PALETTE:
 {palette_text}
 
-Return ONLY valid JSON on one line with no markdown:
-{{"strategy_id": <int>, "reason": "<max 25 words; mention 1-2 key signals>"}}"""
+Return ONLY ONE integer strategy_id from the palette.
+No words. No JSON. No markdown. Example valid outputs: 0 or 3 or 5."""
 
-    inputs = tok(prompt, return_tensors="pt")
-    inputs = {k: v.to(mdl.device) for k, v in inputs.items()}
+    if hasattr(tok, "apply_chat_template"):
+        messages = [
+            {"role": "system", "content": "You are a strict controller. Output exactly one integer strategy_id only."},
+            {"role": "user", "content": prompt},
+        ]
+        model_inputs = tok.apply_chat_template(
+            messages,
+            tokenize=True,
+            add_generation_prompt=True,
+            return_tensors="pt",
+        )
+        inputs = {"input_ids": model_inputs.to(mdl.device)}
+        if tok.pad_token_id is not None:
+            inputs["attention_mask"] = (inputs["input_ids"] != tok.pad_token_id).long()
+    else:
+        inputs = tok(prompt, return_tensors="pt")
+        inputs = {k: v.to(mdl.device) for k, v in inputs.items()}
     with torch.no_grad():
         out = mdl.generate(
             **inputs,
