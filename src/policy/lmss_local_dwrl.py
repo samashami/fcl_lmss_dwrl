@@ -19,13 +19,15 @@ _CACHE: Dict[str, Any] = {"tok": None, "mdl": None, "model_name": None}
 
 
 def _extract_first_json_object(text: str) -> Optional[Dict[str, Any]]:
-    m = re.search(r"\{.*?\}", text, flags=re.DOTALL)
-    if not m:
-        return None
-    try:
-        return json.loads(m.group(0).replace("\n", " ").strip())
-    except Exception:
-        return None
+    # Try all JSON-looking spans and pick the first valid one containing strategy_id.
+    for m in re.finditer(r"\{.*?\}", text, flags=re.DOTALL):
+        try:
+            obj = json.loads(m.group(0).replace("\n", " ").strip())
+            if isinstance(obj, dict) and ("strategy_id" in obj):
+                return obj
+        except Exception:
+            continue
+    return None
 
 
 def _build_action(strategy_id: int) -> Dict[str, Any]:
@@ -124,7 +126,10 @@ Return ONLY valid JSON on one line with no markdown:
             pad_token_id=tok.eos_token_id,
             eos_token_id=tok.eos_token_id,
         )
-    txt = tok.decode(out[0], skip_special_tokens=True)
+    # Decode only newly generated tokens (exclude prompt text with embedded JSON).
+    prompt_len = int(inputs["input_ids"].shape[1])
+    gen_ids = out[0][prompt_len:]
+    txt = tok.decode(gen_ids, skip_special_tokens=True)
     parsed = _extract_first_json_object(txt)
     if not parsed or "strategy_id" not in parsed:
         return _build_action(0)
