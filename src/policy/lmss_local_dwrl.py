@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import math
 from typing import Any, Dict, Optional
 
 
@@ -85,9 +86,90 @@ def _build_action(strategy_id: int) -> Dict[str, Any]:
     return {
         "lr_req": float(s["lr"]),
         "replay_req": float(s["replay_ratio"]),
+        "strategy_id": int(strategy_id),
+        "strategy_name": str(s["name"]),
         "notes": f"LMSS_LOCAL strategy={int(strategy_id)}:{s['name']}",
         "policy_source": f"LMSS_LOCAL_{int(strategy_id)}",
     }
+
+
+def _nearest_strategy_id(target_lr: float, target_rep: float) -> int:
+    best_sid = 0
+    best_score = float("inf")
+    t_lr = max(1e-12, float(target_lr))
+    t_rep = float(target_rep)
+    for sid, cfg in STRATEGY_PALETTE.items():
+        lr = max(1e-12, float(cfg["lr"]))
+        rep = float(cfg["replay_ratio"])
+        lr_score = abs(math.log10(lr) - math.log10(t_lr))
+        rep_score = abs(rep - t_rep)
+        score = (3.0 * rep_score) + lr_score
+        if score < best_score:
+            best_score = score
+            best_sid = int(sid)
+    return best_sid
+
+
+def _postprocess_strategy_id(
+    proposed_sid: int,
+    dval: float,
+    forget_mean: float,
+    div: float,
+    ps_recall: float,
+    tetra_recall: float,
+    last_2_actions: list[int],
+) -> tuple[int, list[str]]:
+    """
+    Deterministic guardrails to reduce noisy LLM oscillations on small/imbalanced DWRL:
+    - safety floor on replay during instability / weak-class collapse
+    - de-escalation when already improving and stable
+    - smooth transitions from previous action (bounded replay/lr jumps)
+    """
+    sid = int(proposed_sid)
+    notes: list[str] = []
+    cfg = STRATEGY_PALETTE.get(sid, STRATEGY_PALETTE[0])
+
+    unstable = (forget_mean > 0.05) or (div > 0.10)
+    weak_class = (ps_recall < 0.45) or (tetra_recall < 0.45)
+    improving_stable = (dval > 0.01) and (forget_mean < 0.03) and (div < 0.07)
+
+    if unstable and float(cfg["replay_ratio"]) < 0.25:
+        sid = 2 if (forget_mean > 0.07 or div > 0.12) else 1
+        cfg = STRATEGY_PALETTE[sid]
+        notes.append("gate:stability_floor")
+
+    if weak_class and float(cfg["replay_ratio"]) < 0.25:
+        sid = 1
+        cfg = STRATEGY_PALETTE[sid]
+        notes.append("gate:weak_class_floor")
+
+    if improving_stable and sid in (2, 3, 5):
+        sid = 0
+        cfg = STRATEGY_PALETTE[sid]
+        notes.append("gate:de_escalate_on_improve")
+
+    if last_2_actions:
+        try:
+            last_sid = int(last_2_actions[-1])
+        except Exception:
+            last_sid = sid
+        prev = STRATEGY_PALETTE.get(last_sid, STRATEGY_PALETTE[0])
+        prev_lr = float(prev["lr"])
+        prev_rep = float(prev["replay_ratio"])
+        tgt_lr = float(cfg["lr"])
+        tgt_rep = float(cfg["replay_ratio"])
+
+        rep_lo, rep_hi = prev_rep - 0.10, prev_rep + 0.10
+        lr_lo, lr_hi = prev_lr / 1.35, prev_lr * 1.35
+        bounded_rep = max(rep_lo, min(rep_hi, tgt_rep))
+        bounded_lr = max(lr_lo, min(lr_hi, tgt_lr))
+        smoothed_sid = _nearest_strategy_id(bounded_lr, bounded_rep)
+
+        if smoothed_sid != sid:
+            sid = smoothed_sid
+            notes.append("gate:smooth_transition")
+
+    return sid, notes
 
 def _fallback_strategy(
     dval: float,
@@ -135,9 +217,18 @@ def lmss_decide_action_local_dwrl(
     dacc_hist = [float(x) for x in g.get("dacc_hist", [])[-2:]]
     last_2_actions = state.get("last_2_actions", [])
     pvc = float(g.get("per_class_val_recall", {}).get("PVC", 1.0))
+    ps = float(g.get("per_class_val_recall", {}).get("PS", 1.0))
+    tetra = float(g.get("per_class_val_recall", {}).get("TETRA", 1.0))
 
     if div > 0.20 or forget_mean > 0.12:
-        return _build_action(3)
+        action = _build_action(3)
+        action["parse_mode"] = "hard_guard"
+        action["parse_fail"] = False
+        action["raw_strategy_id"] = 3
+        action["gate_applied"] = True
+        action["gate_notes"] = "gate:extreme_instability"
+        action["notes"] = f"{action['notes']} | parse_mode=hard_guard | parse_fail=False | gate:extreme_instability"
+        return action
     # Plateau guard: avoid repeating Hold when dacc is non-positive for 2 rounds.
     if (
         len(dacc_hist) >= 2
@@ -149,7 +240,15 @@ def lmss_decide_action_local_dwrl(
         and int(last_2_actions[-1]) == 0
         and int(last_2_actions[-2]) == 0
     ):
-        return _build_action(1 if pvc < 0.70 else 2)
+        sid = 1 if pvc < 0.70 else 2
+        action = _build_action(sid)
+        action["parse_mode"] = "hard_guard"
+        action["parse_fail"] = False
+        action["raw_strategy_id"] = sid
+        action["gate_applied"] = True
+        action["gate_notes"] = "gate:plateau_guard"
+        action["notes"] = f"{action['notes']} | parse_mode=hard_guard | parse_fail=False | gate:plateau_guard"
+        return action
 
     # LLM selection path
     try:
@@ -157,8 +256,24 @@ def lmss_decide_action_local_dwrl(
         from transformers import AutoModelForCausalLM, AutoTokenizer
     except Exception:
         sid = _fallback_strategy(dval, forget_mean, div, dacc_hist, [int(x) for x in last_2_actions], pvc)
-        action = _build_action(sid)
-        action["notes"] = f"{action['notes']} | fallback(no transformers)"
+        sid_pp, gate_notes = _postprocess_strategy_id(
+            proposed_sid=sid,
+            dval=dval,
+            forget_mean=forget_mean,
+            div=div,
+            ps_recall=ps,
+            tetra_recall=tetra,
+            last_2_actions=[int(x) for x in last_2_actions],
+        )
+        action = _build_action(sid_pp)
+        action["parse_mode"] = "fallback"
+        action["parse_fail"] = True
+        action["raw_strategy_id"] = int(sid)
+        action["gate_applied"] = bool(gate_notes or sid_pp != sid)
+        action["gate_notes"] = ",".join(gate_notes) if gate_notes else ""
+        action["notes"] = f"{action['notes']} | parse_mode=fallback | parse_fail=True | fallback(no transformers)"
+        if gate_notes:
+            action["notes"] = f"{action['notes']} | {action['gate_notes']}"
         return action
 
     if (
@@ -166,14 +281,37 @@ def lmss_decide_action_local_dwrl(
         or _CACHE["mdl"] is None
         or _CACHE["model_name"] != model_name
     ):
-        tok = AutoTokenizer.from_pretrained(model_name)
-        mdl = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            torch_dtype=torch.float16 if torch.cuda.is_available() else None,
-        )
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        mdl = mdl.to(device)
-        _CACHE["tok"], _CACHE["mdl"], _CACHE["model_name"] = tok, mdl, model_name
+        try:
+            tok = AutoTokenizer.from_pretrained(model_name)
+            mdl = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                torch_dtype=torch.float16 if torch.cuda.is_available() else None,
+            )
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            mdl = mdl.to(device)
+            _CACHE["tok"], _CACHE["mdl"], _CACHE["model_name"] = tok, mdl, model_name
+        except Exception as e:
+            print("[LMSS_LOAD_ERROR]", repr(e), flush=True)
+            sid = _fallback_strategy(dval, forget_mean, div, dacc_hist, [int(x) for x in last_2_actions], pvc)
+            sid_pp, gate_notes = _postprocess_strategy_id(
+                proposed_sid=sid,
+                dval=dval,
+                forget_mean=forget_mean,
+                div=div,
+                ps_recall=ps,
+                tetra_recall=tetra,
+                last_2_actions=[int(x) for x in last_2_actions],
+            )
+            action = _build_action(sid_pp)
+            action["parse_mode"] = "fallback"
+            action["parse_fail"] = True
+            action["raw_strategy_id"] = int(sid)
+            action["gate_applied"] = bool(gate_notes or sid_pp != sid)
+            action["gate_notes"] = ",".join(gate_notes) if gate_notes else ""
+            action["notes"] = f"{action['notes']} | parse_mode=fallback | parse_fail=True | fallback(model load fail)"
+            if gate_notes:
+                action["notes"] = f"{action['notes']} | {action['gate_notes']}"
+            return action
 
     tok, mdl = _CACHE["tok"], _CACHE["mdl"]
     s_small = compact_state_fn(state)
@@ -252,10 +390,42 @@ No words. No JSON. No markdown. Example valid outputs: 0 or 3 or 5."""
         print(f"[LMSS_DEBUG] parse_mode={parse_mode} parse_fail={parse_fail} sid={sid}", flush=True)
     if parse_fail:
         sid = _fallback_strategy(dval, forget_mean, div, dacc_hist, [int(x) for x in last_2_actions], pvc)
-        action = _build_action(sid)
+        sid_pp, gate_notes = _postprocess_strategy_id(
+            proposed_sid=sid,
+            dval=dval,
+            forget_mean=forget_mean,
+            div=div,
+            ps_recall=ps,
+            tetra_recall=tetra,
+            last_2_actions=[int(x) for x in last_2_actions],
+        )
+        action = _build_action(sid_pp)
+        action["parse_mode"] = "fallback"
+        action["parse_fail"] = True
+        action["raw_strategy_id"] = int(sid)
+        action["gate_applied"] = bool(gate_notes or sid_pp != sid)
+        action["gate_notes"] = ",".join(gate_notes) if gate_notes else ""
         action["notes"] = f"{action['notes']} | parse_mode=fallback | parse_fail=True"
+        if gate_notes:
+            action["notes"] = f"{action['notes']} | {action['gate_notes']}"
         return action
 
-    action = _build_action(sid)
+    sid_pp, gate_notes = _postprocess_strategy_id(
+        proposed_sid=sid,
+        dval=dval,
+        forget_mean=forget_mean,
+        div=div,
+        ps_recall=ps,
+        tetra_recall=tetra,
+        last_2_actions=[int(x) for x in last_2_actions],
+    )
+    action = _build_action(sid_pp)
+    action["parse_mode"] = str(parse_mode)
+    action["parse_fail"] = False
+    action["raw_strategy_id"] = int(sid)
+    action["gate_applied"] = bool(gate_notes or sid_pp != sid)
+    action["gate_notes"] = ",".join(gate_notes) if gate_notes else ""
     action["notes"] = f"{action['notes']} | parse_mode={parse_mode} | parse_fail=False"
+    if gate_notes:
+        action["notes"] = f"{action['notes']} | {action['gate_notes']}"
     return action

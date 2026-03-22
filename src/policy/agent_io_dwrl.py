@@ -47,7 +47,7 @@ def validate_action_dwrl(action: Dict[str, Any] | None, policy_source: str = "Un
     else:
         notes = clamp_note
 
-    return {
+    out = {
         "lr": float(lr_applied),
         "replay_ratio": float(rep_applied),
         "lr_applied": float(lr_applied),
@@ -59,6 +59,18 @@ def validate_action_dwrl(action: Dict[str, Any] | None, policy_source: str = "Un
         "notes": notes,
         "policy_source": str(raw.get("policy_source", policy_source)),
     }
+    for k in (
+        "strategy_id",
+        "strategy_name",
+        "raw_strategy_id",
+        "parse_mode",
+        "parse_fail",
+        "gate_applied",
+        "gate_notes",
+    ):
+        if k in raw:
+            out[k] = raw[k]
+    return out
 
 
 def write_state_json(run_dir: str | Path, round_id: int, state: Dict[str, Any]) -> str:

@@ -161,6 +161,45 @@ def pick_device(name: str):
     return torch.device(name)
 
 
+def save_controller_strategy_artifacts(run_dir: Path, action_history: list[dict]) -> None:
+    if not action_history:
+        return
+
+    trace_csv = run_dir / "controller_strategy_trace.csv"
+    with open(trace_csv, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=list(action_history[0].keys()))
+        w.writeheader()
+        for row in action_history:
+            w.writerow(row)
+    print(f"[Saved] controller_strategy_trace.csv -> {trace_csv}", flush=True)
+
+    hist_rows = []
+    total = max(1, len(action_history))
+    by_sid = {}
+    for row in action_history:
+        sid = int(row.get("strategy_id", 0))
+        by_sid.setdefault(sid, []).append(row)
+    for sid in sorted(by_sid.keys()):
+        rows = by_sid[sid]
+        hist_rows.append(
+            {
+                "strategy_id": int(sid),
+                "strategy_name": str(rows[0].get("strategy_name", "")),
+                "count": int(len(rows)),
+                "fraction": float(len(rows) / total),
+                "mean_lr_applied": float(np.mean([float(x["lr_applied"]) for x in rows])),
+                "mean_replay_applied": float(np.mean([float(x["replay_applied"]) for x in rows])),
+            }
+        )
+    hist_csv = run_dir / "controller_strategy_histogram.csv"
+    with open(hist_csv, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=list(hist_rows[0].keys()))
+        w.writeheader()
+        for row in hist_rows:
+            w.writerow(row)
+    print(f"[Saved] controller_strategy_histogram.csv -> {hist_csv}", flush=True)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--clients", type=int, default=3)
@@ -374,16 +413,24 @@ def main():
             }
         hp = validate_action_dwrl(raw_action, policy_source=str(raw_action.get("policy_source", args.controller)))
         write_action_json(io_root, r, hp, policy_source=str(hp.get("policy_source", args.controller)))
+        strategy_id = int(hp.get("strategy_id", int(str(hp.get("policy_source", "LMSS_LOCAL_0")).split("_")[-1]) if str(hp.get("policy_source", "")).startswith("LMSS_LOCAL_") else 0))
         action_history.append(
             {
                 "round": int(r),
-                "strategy_id": int(str(hp.get("policy_source", "LMSS_LOCAL_0")).split("_")[-1]) if str(hp.get("policy_source", "")).startswith("LMSS_LOCAL_") else 0,
+                "strategy_id": strategy_id,
+                "strategy_name": str(hp.get("strategy_name", "")),
+                "raw_strategy_id": int(hp.get("raw_strategy_id", strategy_id)),
+                "parse_mode": str(hp.get("parse_mode", "")),
+                "parse_fail": bool(hp.get("parse_fail", False)),
+                "gate_applied": bool(hp.get("gate_applied", False)),
+                "gate_notes": str(hp.get("gate_notes", "")),
                 "policy_source": str(hp.get("policy_source", args.controller)),
                 "lr_applied": float(hp["lr_applied"]),
                 "replay_applied": float(hp["replay_applied"]),
                 "notes": str(hp["notes"]),
             }
         )
+        save_controller_strategy_artifacts(run_dir, action_history)
 
         print(
             f"[HP r={r}] controller={args.controller} "
@@ -524,6 +571,8 @@ def main():
             for row in client_rows:
                 w.writerow(row)
         print(f"[Saved] client_logs.csv -> {client_log_csv}", flush=True)
+
+    save_controller_strategy_artifacts(run_dir, action_history)
 
     # final artifacts (model + per-class + confusion)
     # use last computed accs if available, otherwise evaluate once
