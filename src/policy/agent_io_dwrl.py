@@ -63,6 +63,8 @@ def validate_action_dwrl(action: Dict[str, Any] | None, policy_source: str = "Un
         "strategy_id",
         "strategy_name",
         "raw_strategy_id",
+        "reasoning",
+        "raw_response",
         "parse_mode",
         "parse_fail",
         "gate_applied",

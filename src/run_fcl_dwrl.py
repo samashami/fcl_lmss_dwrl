@@ -27,6 +27,7 @@ from src.policy import (
     compact_state_for_lmss_dwrl,
     lmss_decide_action_api_dwrl,
     lmss_decide_action_local_dwrl,
+    lmss_decide_action_openrouter_dwrl,
     validate_action_dwrl,
     write_action_json,
     write_state_json,
@@ -217,7 +218,7 @@ def main():
     ap.add_argument("--no_val", action="store_true")
     ap.add_argument("--early_round_patience", type=int, default=3)
     ap.add_argument("--early_round_delta", type=float, default=0.2)  # in % points (0.2 = 0.2%)
-    ap.add_argument("--controller", choices=["fixed", "v4", "lmss_local", "lmss_api"], default="fixed")
+    ap.add_argument("--controller", choices=["fixed", "v4", "lmss_local", "lmss_api", "lmss_openrouter"], default="fixed")
     ap.add_argument("--lmss_model", type=str, default="Qwen/Qwen2.5-0.5B-Instruct")
     ap.add_argument("--log_csv", type=str, default="")  # if empty -> run_dir/round_logs.csv
     ap.add_argument("--run_dir", type=str, default="")  # where to save ckpt/metrics
@@ -404,6 +405,12 @@ def main():
                 compact_state_fn=compact_state_for_lmss_dwrl,
                 model="gpt-4o-mini",
             )
+        elif args.controller == "lmss_openrouter":
+            raw_action = lmss_decide_action_openrouter_dwrl(
+                state=state,
+                compact_state_fn=compact_state_for_lmss_dwrl,
+                model=args.lmss_model,
+            )
         else:
             raw_action = {
                 "lr_req": args.lr,
@@ -427,6 +434,7 @@ def main():
                 "policy_source": str(hp.get("policy_source", args.controller)),
                 "lr_applied": float(hp["lr_applied"]),
                 "replay_applied": float(hp["replay_applied"]),
+                "raw_response": str(hp.get("raw_response", "")),
                 "notes": str(hp["notes"]),
             }
         )
@@ -440,6 +448,16 @@ def main():
             f"({hp['notes']})",
             flush=True,
         )
+        if args.controller == "lmss_openrouter":
+            print(
+                f"[LMSS_OPENROUTER_DWRL_APPLIED] "
+                f"policy_source={hp.get('policy_source', '')} "
+                f"raw_response={hp.get('raw_response', '')} "
+                f"strategy_id={hp.get('strategy_id', '')} "
+                f"applied_lr={hp['lr_applied']:.6f} "
+                f"applied_replay_ratio={hp['replay_applied']:.2f}",
+                flush=True,
+            )
         # broadcast
         for c in clients:
             c.load_state_from(global_model)
@@ -541,6 +559,7 @@ def main():
             "divergence": float(div_norm),
             "notes": str(hp["notes"]),
             "policy_source": str(hp.get("policy_source", args.controller)),
+            "raw_response": str(hp.get("raw_response", "")),
         })
 
         # --- round-level early stopping on GLOBAL val_acc ---
